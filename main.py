@@ -148,50 +148,59 @@ except ImportError as e:
 # --- ЯДРО DB ---
 class CoreDB:
     def __init__(self, db_name="concrete_data.db"):
-        self.conn = sqlite3.connect(db_name, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute(
-            'CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, file TEXT, op TEXT, status TEXT, time DATETIME DEFAULT CURRENT_TIMESTAMP)')
-        self.cursor.execute(
-            'CREATE TABLE IF NOT EXISTS index_files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT, size TEXT, fmt TEXT, accessed DATETIME DEFAULT CURRENT_TIMESTAMP)')
-        self.conn.commit()
-
-    def log(self, file, op, status):
-        self.cursor.execute('INSERT INTO history (file, op, status) VALUES (?, ?, ?)',
-                            (file, op, status));
-        self.conn.commit()
-
-    def index(self, path, name, size, fmt):
-        try:
+        self.lock = threading.Lock()
+        with self.lock:
+            self.conn = sqlite3.connect(db_name, check_same_thread=False)
+            self.cursor = self.conn.cursor()
             self.cursor.execute(
-                'INSERT OR IGNORE INTO index_files (path, name, size, fmt, accessed) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
-                (path, name, size, fmt))
-            self.cursor.execute('UPDATE index_files SET accessed = CURRENT_TIMESTAMP, size = ?, fmt = ? WHERE path = ?',
-                                (size, fmt, path))
-        except:
-            pass;
+                'CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, file TEXT, op TEXT, status TEXT, time DATETIME DEFAULT CURRENT_TIMESTAMP)')
+            self.cursor.execute(
+                'CREATE TABLE IF NOT EXISTS index_files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, name TEXT, size TEXT, fmt TEXT, accessed DATETIME DEFAULT CURRENT_TIMESTAMP)')
             self.conn.commit()
 
+    def log(self, file, op, status):
+        with self.lock:
+            self.cursor.execute('INSERT INTO history (file, op, status) VALUES (?, ?, ?)',
+                                (file, op, status))
+            self.conn.commit()
+
+    def index(self, path, name, size, fmt):
+        with self.lock:
+            try:
+                self.cursor.execute(
+                    'INSERT OR IGNORE INTO index_files (path, name, size, fmt, accessed) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
+                    (path, name, size, fmt))
+                self.cursor.execute('UPDATE index_files SET accessed = CURRENT_TIMESTAMP, size = ?, fmt = ? WHERE path = ?',
+                                    (size, fmt, path))
+                self.conn.commit()
+            except Exception:
+                pass
+
     def clear_h(self):
-        self.cursor.execute('DELETE FROM history');
-        self.conn.commit()
+        with self.lock:
+            self.cursor.execute('DELETE FROM history')
+            self.conn.commit()
 
     def clear_i(self):
-        self.cursor.execute('DELETE FROM index_files');
-        self.conn.commit()
+        with self.lock:
+            self.cursor.execute('DELETE FROM index_files')
+            self.conn.commit()
 
     def get_h(self):
-        return self.cursor.execute('SELECT * FROM history ORDER BY id DESC LIMIT 100').fetchall()
+        with self.lock:
+            return self.cursor.execute('SELECT * FROM history ORDER BY id DESC LIMIT 100').fetchall()
 
     def get_i(self, q=""):
-        if q: return self.cursor.execute(
-            'SELECT * FROM index_files WHERE name LIKE ? OR path LIKE ? ORDER BY accessed DESC',
-            (f"%{q}%", f"%{q}%")).fetchall()
-        return self.cursor.execute('SELECT * FROM index_files ORDER BY accessed DESC LIMIT 500').fetchall()
+        with self.lock:
+            if q: return self.cursor.execute(
+                'SELECT * FROM index_files WHERE name LIKE ? OR path LIKE ? ORDER BY accessed DESC',
+                (f"%{q}%", f"%{q}%")).fetchall()
+            return self.cursor.execute('SELECT * FROM index_files ORDER BY accessed DESC LIMIT 500').fetchall()
 
     def close(self):
-        if self.conn:
-            self.conn.close()
+        with self.lock:
+            if self.conn:
+                self.conn.close()
 
 
 # --- ПРОЦЕССОР ---
@@ -205,35 +214,47 @@ class Processor:
             ext = os.path.splitext(path)[1].lower()
             if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.ico', '.gif']:
                 with Image.open(path) as img:
-                    data["ТИП"] = "ИЗОБРАЖЕНИЕ";
+                    data["ТИП"] = "ИЗОБРАЖЕНИЕ"
                     data["МАТРИЦА"] = f"{img.width}x{img.height}"
             elif ext in ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.mp4', '.avi', '.mkv', '.webm']:
-                tag = TinyTag.get(path);
-                data["ТИП"] = "МЕДИА-ПОТОК";
+                tag = TinyTag.get(path)
+                data["ТИП"] = "МЕДИА-ПОТОК"
                 data["ХРОНО"] = f"{tag.duration:.1f} сек" if tag.duration else "N/A"
             else:
                 data["ТИП"] = "НЕИЗВЕСТНО"
-        except:
+        except Exception:
             data["ОШИБКА"] = "Доступ ограничен"
         return data
 
     @staticmethod
-    def get_preview(path):
+    def get_preview_image(path):
         try:
             ext = os.path.splitext(path)[1].lower()
             if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.ico', '.gif']:
-                img = Image.open(path)
+                with Image.open(path) as img:
+                    img.load()
+                    img.thumbnail((450, 450), Image.Resampling.LANCZOS)
+                    return img
             elif ext in ['.mp4', '.avi', '.mkv', '.webm']:
-                clip = VideoFileClip(path)
-                img = Image.fromarray(clip.get_frame(1 if clip.duration > 1 else 0))
-                clip.close()
-            else:
-                return None
-
-            img.thumbnail((450, 450), Image.Resampling.LANCZOS)
-            return ImageTk.PhotoImage(img)
-        except:
+                with VideoFileClip(path) as clip:
+                    frame_array = clip.get_frame(1 if clip.duration > 1 else 0)
+                    img = Image.fromarray(frame_array)
+                    img.thumbnail((450, 450), Image.Resampling.LANCZOS)
+                    return img
             return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def get_preview(path):
+        # Оставляем этот метод для обратной совместимости, но теперь он использует get_preview_image
+        img = Processor.get_preview_image(path)
+        if img:
+            try:
+                return ImageTk.PhotoImage(img)
+            except Exception:
+                return None
+        return None
 
     @staticmethod
     def convert(path, target):
@@ -249,22 +270,24 @@ class Processor:
                 return True, out
             elif ext in ['.mp4', '.avi', '.mkv', '.webm', '.gif', '.mp3', '.wav', '.ogg', '.flac']:
                 clip = VideoFileClip(path) if ext in ['.mp4', '.avi', '.mkv', '.webm', '.gif'] else AudioFileClip(path)
-                if tgt == 'MP4':
-                    clip.write_videofile(out, codec='libx264', audio_codec='aac', verbose=False, logger=None)
-                elif tgt == 'AVI':
-                    clip.write_videofile(out, codec='png', verbose=False, logger=None)
-                elif tgt == 'WEBM':
-                    clip.write_videofile(out, codec='libvpx', verbose=False, logger=None)
-                elif tgt == 'GIF':
-                    clip.write_gif(out, fps=10, verbose=False, logger=None)
-                elif tgt == 'MP3':
-                    (clip.audio if hasattr(clip, 'audio') else clip).write_audiofile(out, verbose=False, logger=None)
-                elif tgt == 'WAV':
-                    (clip.audio if hasattr(clip, 'audio') else clip).write_audiofile(out, verbose=False, logger=None)
-                else:
-                    return False, "Формат не поддерживается"
-                clip.close()
-                return True, out
+                try:
+                    if tgt == 'MP4':
+                        clip.write_videofile(out, codec='libx264', audio_codec='aac', verbose=False, logger=None)
+                    elif tgt == 'AVI':
+                        clip.write_videofile(out, codec='png', verbose=False, logger=None)
+                    elif tgt == 'WEBM':
+                        clip.write_videofile(out, codec='libvpx', verbose=False, logger=None)
+                    elif tgt == 'GIF':
+                        clip.write_gif(out, fps=10, verbose=False, logger=None)
+                    elif tgt == 'MP3':
+                        (clip.audio if hasattr(clip, 'audio') else clip).write_audiofile(out, verbose=False, logger=None)
+                    elif tgt == 'WAV':
+                        (clip.audio if hasattr(clip, 'audio') else clip).write_audiofile(out, verbose=False, logger=None)
+                    else:
+                        return False, "Формат не поддерживается"
+                    return True, out
+                finally:
+                    clip.close()
             return False, "Сбой формата"
         except Exception as e:
             return False, str(e)
@@ -277,6 +300,7 @@ class App(tk.Tk):
         self.title("CONCRETE")
         self.geometry("1100x750")
         self.configure(bg=COLORS["bg_main"])
+        self.current_preview_path = None
 
         self._setup_icon()
         try:
@@ -300,8 +324,9 @@ class App(tk.Tk):
             icon_path = os.path.join(base_path, "icon.ico")
             if os.path.exists(icon_path):
                 self.iconbitmap(icon_path)
-                img = Image.open(icon_path).resize((48, 48), Image.Resampling.LANCZOS)
-                self.main_icon_img = ImageTk.PhotoImage(img)
+                with Image.open(icon_path) as img:
+                    resized_img = img.resize((48, 48), Image.Resampling.LANCZOS)
+                    self.main_icon_img = ImageTk.PhotoImage(resized_img)
         except Exception as e:
             print(f"Ошибка при загрузке icon.ico: {e}")
 
@@ -484,18 +509,47 @@ class App(tk.Tk):
 
     def on_sel(self, e):
         try:
-            path = self.queue[self.lst.curselection()[0]]
-            d = Processor.scan(path);
-            self.txt.config(state='normal');
+            selection = self.lst.curselection()
+            if not selection:
+                return
+            path = self.queue[selection[0]]
+            self.current_preview_path = path
+
+            # Быстрое сканирование метаданных
+            d = Processor.scan(path)
+            self.txt.config(state='normal')
             self.txt.delete('1.0', tk.END)
-            for k, v in d.items(): self.txt.insert(tk.END, f"{k}: {v}\n")
+            for k, v in d.items(): 
+                self.txt.insert(tk.END, f"{k}: {v}\n")
             self.txt.config(state='disabled')
 
-            self.img_ref = Processor.get_preview(path)
-            self.p_img.config(image=self.img_ref if self.img_ref else "",
-                              text="" if self.img_ref else "[ НЕТ СИГНАЛА ]")
-        except:
+            # Устанавливаем статус загрузки превью
+            self.p_img.config(image="", text="[ ЗАГРУЗКА ПРЕВЬЮ... ]")
+
+            # Запускаем фоновую генерацию превью
+            threading.Thread(target=self._load_preview_async, args=(path,), daemon=True).start()
+        except Exception:
             pass
+
+    def _load_preview_async(self, path):
+        # Генерируем изображение в фоновом потоке
+        img = Processor.get_preview_image(path)
+        # Передаем результат в главный поток через self.after
+        self.after(0, lambda: self._update_preview_gui(path, img))
+
+    def _update_preview_gui(self, path, img):
+        # Проверяем, что текущий выбранный файл все еще совпадает с обрабатываемым
+        if self.current_preview_path == path:
+            if img:
+                try:
+                    self.img_ref = ImageTk.PhotoImage(img)
+                    self.p_img.config(image=self.img_ref, text="")
+                except Exception:
+                    self.img_ref = None
+                    self.p_img.config(image="", text="[ ОШИБКА ПРЕДПРОСМОТРА ]")
+            else:
+                self.img_ref = None
+                self.p_img.config(image="", text="[ НЕТ СИГНАЛА ]")
 
     def run_c(self):
         if not self.queue: return
